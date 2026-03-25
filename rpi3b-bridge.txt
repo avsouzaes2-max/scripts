@@ -1,0 +1,270 @@
+Vou te entregar isso no nível “produção enxuta”:
+
+* Script idempotente (pode rodar mais de uma vez sem quebrar)
+* Persistência via `sysctl`, `dhcpcd` e `systemd`
+* Integração limpa com Proxmox (vmbr)
+
+O objetivo técnico aqui é:
+👉 **Pseudo-bridge via Proxy ARP + L3 forwarding**, mantendo tudo em **192.168.10.0/24**
+
+---
+
+# 📦 1. SCRIPT AUTOMATIZADO (Raspberry Pi)
+
+Crie o arquivo:
+
+```bash
+nano /usr/local/sbin/rpi-bridge.sh
+```
+
+Cole:
+
+```bash
+#!/bin/bash
+
+set -e
+
+echo "[+] Configurando Raspberry Pi como pseudo-bridge (Wi-Fi -> Ethernet)"
+
+# Interfaces
+WLAN="wlan0"
+ETH="eth0"
+
+# Rede
+LAN_NET="192.168.10.0/24"
+
+echo "[+] Ativando IP Forwarding"
+sysctl -w net.ipv4.ip_forward=1
+
+echo "[+] Configurando Proxy ARP"
+sysctl -w net.ipv4.conf.all.proxy_arp=1
+sysctl -w net.ipv4.conf.$WLAN.proxy_arp=1
+sysctl -w net.ipv4.conf.$ETH.proxy_arp=1
+
+echo "[+] Ajustando comportamento ARP"
+sysctl -w net.ipv4.conf.all.arp_filter=1
+sysctl -w net.ipv4.conf.all.arp_ignore=2
+
+echo "[+] Limpando IP da interface Ethernet"
+ip addr flush dev $ETH
+
+echo "[+] Garantindo que wlan0 esteja via DHCP"
+dhclient -v $WLAN || true
+
+echo "[+] Adicionando rota local explícita"
+ip route add $LAN_NET dev $ETH || true
+
+echo "[+] Ajustando regras de firewall (permitir forwarding)"
+iptables -C FORWARD -i $ETH -o $WLAN -j ACCEPT 2>/dev/null || \
+iptables -A FORWARD -i $ETH -o $WLAN -j ACCEPT
+
+iptables -C FORWARD -i $WLAN -o $ETH -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+iptables -A FORWARD -i $WLAN -o $ETH -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+echo "[+] Configuração aplicada com sucesso"
+```
+
+---
+
+### 🔐 Permissão:
+
+```bash
+chmod +x /usr/local/sbin/rpi-bridge.sh
+```
+
+---
+
+# ⚙️ 2. PERSISTÊNCIA (MODO PRODUÇÃO)
+
+## 🧠 sysctl persistente
+
+Edite:
+
+```bash
+nano /etc/sysctl.d/99-rpi-bridge.conf
+```
+
+```bash
+net.ipv4.ip_forward=1
+
+net.ipv4.conf.all.proxy_arp=1
+net.ipv4.conf.wlan0.proxy_arp=1
+net.ipv4.conf.eth0.proxy_arp=1
+
+net.ipv4.conf.all.arp_filter=1
+net.ipv4.conf.all.arp_ignore=2
+```
+
+Aplicar:
+
+```bash
+sysctl --system
+```
+
+---
+
+## 🌐 dhcpcd (Wi-Fi automático)
+
+```bash
+nano /etc/dhcpcd.conf
+```
+
+Garanta:
+
+```bash
+interface wlan0
+  require dhcp
+
+interface eth0
+  denyinterfaces eth0
+```
+
+👉 Isso evita que o Pi tente usar IP local na ethernet.
+
+---
+
+## 🔁 systemd service
+
+```bash
+nano /etc/systemd/system/rpi-bridge.service
+```
+
+```ini
+[Unit]
+Description=Raspberry Pi WiFi Bridge (Proxy ARP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rpi-bridge.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+### Ativar:
+
+```bash
+systemctl daemon-reexec
+systemctl daemon-reload
+systemctl enable rpi-bridge
+systemctl start rpi-bridge
+```
+
+---
+
+# 🔌 3. CONFIGURAÇÃO NO PROXMOX
+
+No host Proxmox, edite:
+
+```bash
+nano /etc/network/interfaces
+```
+
+---
+
+## ✔️ Configuração recomendada:
+
+```bash
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet manual
+
+auto vmbr0
+iface vmbr0 inet dhcp
+    bridge-ports eth0
+    bridge-stp off
+    bridge-fd 0
+```
+
+---
+
+### 🔍 Explicação técnica:
+
+* `eth0` → conecta no Raspberry Pi
+* `vmbr0` → bridge usada pelas VMs
+* DHCP vem direto do TP-Link (via Proxy ARP)
+
+---
+
+# 🧪 4. TESTES
+
+## No Raspberry Pi:
+
+```bash
+ip a
+ip r
+```
+
+## No Proxmox:
+
+```bash
+dhclient vmbr0
+ip a
+```
+
+👉 Você deve ver:
+
+* IP: `192.168.10.x`
+* Gateway: `192.168.10.1` (TP-Link)
+
+---
+
+## Testes de conectividade:
+
+```bash
+ping 192.168.10.1
+ping 8.8.8.8
+```
+
+---
+
+# ⚠️ OBSERVAÇÕES DE PRODUÇÃO
+
+### 🔻 Limitações reais:
+
+* Não é bridge L2 real (é emulação via ARP)
+* Broadcasts são limitados
+* Pode falhar com:
+
+  * DHCP muito restritivo
+  * VLANs
+  * alguns protocolos (Wake-on-LAN, etc.)
+
+---
+
+### 🔥 Hardening opcional (recomendado)
+
+Você pode evoluir isso com:
+
+* `nftables` ao invés de iptables
+* monitoramento via SNMP (já que você usa isso)
+* watchdog para reconexão Wi-Fi
+
+---
+
+# 🚀 RESUMO FINAL
+
+Você agora tem:
+
+✔ Raspberry Pi atuando como “bridge lógico”
+✔ Proxmox recebendo IP do TP-Link
+✔ Configuração persistente
+✔ Estrutura limpa e reproduzível
+
+---
+
+Se quiser evoluir isso para nível profissional mesmo, posso te ajudar a montar:
+
+* versão com **nftables + logging**
+* fallback automático de rede
+* monitoramento (Zabbix / Prometheus)
+* ou migrar isso para uma arquitetura estilo ISP (já alinhado com o que você faz)
+
+Só me diga qual direção quer seguir.
